@@ -1,15 +1,9 @@
 from flask import Flask, request, jsonify
-import asyncio
+import asyncio, time, binascii, json
+import aiohttp, requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-import binascii
-import aiohttp
-import requests
-import json
-import like_pb2
-import uid_generator_pb2
-import visit_count_pb2
-from google.protobuf.message import DecodeError
+import like_pb2, uid_generator_pb2, visit_count_pb2
 from collections import OrderedDict
 
 app = Flask(__name__)
@@ -23,7 +17,7 @@ def load_tokens(region):
     try:
         if region == "IND":
             with open("token_ind.json") as f: return json.load(f)
-        elif region in {"BR", "US", "SAC", "NA"}:
+        elif region in {"BR","US","SAC","NA"}:
             with open("token_br.json") as f: return json.load(f)
         else:
             with open("token_bd.json") as f: return json.load(f)
@@ -35,25 +29,22 @@ def load_tokens(region):
 def encrypt_message(plaintext):
     key = b'Yg&tc%DEuh6%Zc^8'
     iv  = b'6oyZDr22E3ychjM%'
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    return binascii.hexlify(cipher.encrypt(pad(plaintext, AES.block_size))).decode('utf-8')
+    return binascii.hexlify(
+        AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, AES.block_size))
+    ).decode('utf-8')
 
 
-def encrypt_like_message(uid, region):
-    msg = like_pb2.like()
-    msg.uid = int(uid)
-    msg.region = region
-    return encrypt_message(msg.SerializeToString())
+def encrypt_like(uid, region):
+    m = like_pb2.like(); m.uid = int(uid); m.region = region
+    return encrypt_message(m.SerializeToString())
 
 
 def encrypt_uid_proto(uid):
-    msg = uid_generator_pb2.uid_generator()
-    msg.saturn_ = int(uid)
-    msg.garena = 1
-    return encrypt_message(msg.SerializeToString())
+    m = uid_generator_pb2.uid_generator(); m.saturn_ = int(uid); m.garena = 1
+    return encrypt_message(m.SerializeToString())
 
 
-def _headers(token):
+def headers(token):
     return {
         "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
         "Connection": "Keep-Alive",
@@ -67,59 +58,134 @@ def _headers(token):
     }
 
 
-async def post_async(url, encrypted_hex, token):
+def post_sync(url, enc_hex, token):
     try:
-        edata = bytes.fromhex(encrypted_hex)
-        async with aiohttp.ClientSession() as s:
-            async with s.post(url, data=edata, headers=_headers(token),
-                              timeout=aiohttp.ClientTimeout(total=20)) as r:
-                body = await r.text()
-                return {"success": r.status == 200, "status": r.status,
-                        "len": len(body)}
+        return requests.post(url, data=bytes.fromhex(enc_hex),
+                             headers=headers(token), verify=False, timeout=15)
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        app.logger.error(f"post_sync err {url}: {e}")
+        return None
 
 
-def post_sync(url, encrypted_hex, token):
-    edata = bytes.fromhex(encrypted_hex)
-    return requests.post(url, data=edata, headers=_headers(token),
-                         verify=False, timeout=15)
+# ========= URL ROUTERS =========
+def base_url(region):
+    if region == "IND": return "https://client.ind.freefiremobile.com"
+    if region in {"BR","US","SAC","NA"}: return "https://client.us.freefiremobile.com"
+    return "https://clientbp.ggpolarbear.com"
+
+def show_url(region):    return base_url(region) + "/GetPlayerPersonalShow"
+def like_url(region):    return base_url(region) + "/LikeProfile"
+
+# 🎯 Friend request endpoints — multiple candidates (একটা কাজ করবে)
+FRIEND_ENDPOINTS = [
+    "/RequestAddingFriend",
+    "/FriendRequest",
+    "/AddFriend",
+    "/SendFriendRequest",
+    "/friend_request",
+    "/RequestFriend",
+]
 
 
-def get_show_url(region):
-    if region == "IND": return "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
-    if region in {"BR","US","SAC","NA"}: return "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
-    return "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
-
-def get_like_url(region):
-    if region == "IND": return "https://client.ind.freefiremobile.com/LikeProfile"
-    if region in {"BR","US","SAC","NA"}: return "https://client.us.freefiremobile.com/LikeProfile"
-    return "https://clientbp.ggpolarbear.com/LikeProfile"
-
-def get_friend_url(region):
-    if region == "IND": return "https://client.ind.freefiremobile.com/FriendRequest"
-    if region in {"BR","US","SAC","NA"}: return "https://client.us.freefiremobile.com/FriendRequest"
-    return "https://clientbp.ggpolarbear.com/FriendRequest"
-
-
-def fetch_player_info(uid, region, token):
+def fetch_info(uid, region, token):
+    r = post_sync(show_url(region), encrypt_uid_proto(uid), token)
+    if r is None: return None
     try:
-        encrypted = encrypt_uid_proto(uid)
-        r = post_sync(get_show_url(region), encrypted, token)
         info = visit_count_pb2.Info()
         info.ParseFromString(r.content)
         return info
     except Exception as e:
-        app.logger.error(f"info err: {e}")
+        app.logger.error(f"parse err: {e}")
         return None
+
+
+# ========= CORE: try like with ALL tokens until it works =========
+def try_like_until_success(uid, region, tokens, target_likes):
+    encrypted = encrypt_like(uid, region)
+    url = like_url(region)
+    tried = []
+
+    for i, td in enumerate(tokens):
+        tk = td.get("token")
+        if not tk: continue
+        hint = f"...{tk[-8:]}"
+
+        try:
+            r = post_sync(url, encrypted, tk)
+            if r is None:
+                tried.append({"token": i+1, "hint": hint, "http": "err"})
+                continue
+
+            if r.status_code != 200:
+                tried.append({"token": i+1, "hint": hint, "http": r.status_code})
+                continue
+
+            # 200 → server may have accepted. Verify.
+            time.sleep(1.0)
+            chk = fetch_info(uid, region, tk)
+            if chk and chk.AccountInfo.Likes > target_likes:
+                tried.append({"token": i+1, "hint": hint,
+                              "http": 200, "likes": chk.AccountInfo.Likes})
+                return {
+                    "success": True,
+                    "token_no": i+1,
+                    "token_hint": hint,
+                    "likes_after": chk.AccountInfo.Likes,
+                    "gained": chk.AccountInfo.Likes - target_likes,
+                    "tried": tried,
+                }
+            else:
+                tried.append({"token": i+1, "hint": hint,
+                              "http": 200, "note": "no increment"})
+        except Exception as e:
+            tried.append({"token": i+1, "hint": hint, "err": str(e)})
+
+    return {
+        "success": False,
+        "token_no": None,
+        "token_hint": None,
+        "likes_after": target_likes,
+        "gained": 0,
+        "tried": tried,
+    }
+
+
+# ========= Friend request — try multiple endpoints =========
+def try_friend_request(uid, region, token):
+    encrypted = encrypt_like(uid, region)  # reuse like proto (uid + region)
+    endpoint_tries = []
+
+    for ep in FRIEND_ENDPOINTS:
+        url = base_url(region) + ep
+        r = post_sync(url, encrypted, token)
+        if r is None:
+            endpoint_tries.append({"ep": ep, "http": "err"})
+            continue
+        endpoint_tries.append({
+            "ep": ep,
+            "http": r.status_code,
+            "len": len(r.content),
+        })
+        # 404 → endpoint doesn't exist → try next
+        if r.status_code == 404:
+            continue
+        # 200/204/400 → endpoint exists (return whatever it returned)
+        return {
+            "success": r.status_code in (200, 204),
+            "endpoint": ep,
+            "http": r.status_code,
+            "len": len(r.content),
+            "tried": endpoint_tries,
+        }
+
+    return {"success": False, "endpoint": None, "http": 404, "tried": endpoint_tries}
 
 
 @app.route('/visit', methods=['GET'])
 def handle_visits():
     global used_count
 
-    api_key = request.args.get("key")
-    if api_key not in VALID_API_KEYS:
+    if request.args.get("key") not in VALID_API_KEYS:
         return app.response_class(
             response=json.dumps({"error":"Invalid API key","status":3}),
             status=401, mimetype='application/json')
@@ -132,29 +198,24 @@ def handle_visits():
     try:
         tokens = load_tokens(region)
         if not tokens:
-            raise Exception("No tokens available")
-        token = tokens[0]['token']
+            raise Exception("No tokens")
+        token0 = tokens[0]['token']
 
-        # 1) BEFORE info
-        before = fetch_player_info(uid, region, token)
+        # 1) BEFORE
+        before = fetch_info(uid, region, token0)
         if before is None:
             raise Exception("Failed to fetch player info")
         likes_before = before.AccountInfo.Likes
 
-        # 2) Send 1 like + 1 friend request concurrently
-        encrypted_like = encrypt_like_message(uid, region)
+        # 2) LIKE — try tokens sequentially until increment
+        like_result = try_like_until_success(uid, region, tokens, likes_before)
 
-        async def do_both():
-            like_res   = await post_async(get_like_url(region),   encrypted_like, token)
-            friend_res = await post_async(get_friend_url(region), encrypted_like, token)
-            return like_res, friend_res
+        # 3) FRIEND — try multiple endpoints
+        friend_result = try_friend_request(uid, region, token0)
 
-        like_res, friend_res = asyncio.run(do_both())
-
-        # 3) AFTER info
-        after = fetch_player_info(uid, region, token)
-        likes_after = after.AccountInfo.Likes if after else likes_before
-        likes_given = likes_after - likes_before
+        # 4) AFTER
+        likes_after = like_result["likes_after"]
+        likes_given = like_result["gained"]
 
         status = 1 if likes_given > 0 else 2
         if status == 1:
@@ -169,13 +230,17 @@ def handle_visits():
             ("LikesBefore",    likes_before),
             ("LikesAfter",     likes_after),
             ("LikesGiven",     likes_given),
-            ("FriendRequest",  "sent" if friend_res.get("success") else "failed"),
-            ("FriendStatus",   friend_res.get("status", friend_res.get("error","-"))),
-            ("LikeStatus",     like_res.get("status", like_res.get("error","-"))),
+            ("LikeTokenUsed",  like_result["token_hint"] or "-"),
+            ("LikeTokenNo",    like_result["token_no"] or "-"),
+            ("LikeTried",      like_result["tried"]),
+            ("FriendRequest",  "sent" if friend_result["success"] else "failed"),
+            ("FriendEndpoint", friend_result.get("endpoint") or "-"),
+            ("FriendHttp",     friend_result.get("http")),
+            ("FriendTried",    friend_result.get("tried", [])),
             ("status",         status),
             ("daily_limit",    daily_limit),
             ("used",           used_count),
-            ("remaining",      remaining)
+            ("remaining",      remaining),
         ])
         return app.response_class(
             response=json.dumps(result, separators=(',',':')),

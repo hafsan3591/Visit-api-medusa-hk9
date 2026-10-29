@@ -1,50 +1,101 @@
 from flask import Flask, request, jsonify
-import asyncio, time, binascii, json
-import aiohttp, requests
+import asyncio
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-import like_pb2, uid_generator_pb2, visit_count_pb2
+import binascii
+import aiohttp
+import requests
+import json
+import os
+import like_pb2
+import uid_generator_pb2
 from collections import OrderedDict
 
 app = Flask(__name__)
 
+# ================= CONFIG =================
 VALID_API_KEYS = {"HK345"}
 daily_limit = 200
 used_count = 0
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")   # Vercel Env Var দাও
 
-
+# ================= HELPERS =================
 def load_tokens(region):
     try:
         if region == "IND":
-            with open("token_ind.json") as f: return json.load(f)
-        elif region in {"BR","US","SAC","NA"}:
-            with open("token_br.json") as f: return json.load(f)
+            fname = "token_ind.json"
+        elif region in {"BR", "US", "SAC", "NA"}:
+            fname = "token_br.json"
         else:
-            with open("token_bd.json") as f: return json.load(f)
+            fname = "token_bd.json"
+        with open(fname, "r") as f:
+            return json.load(f)
     except Exception as e:
-        app.logger.error(f"token load err: {e}")
+        app.logger.error(f"load_tokens {region}: {e}")
         return None
 
 
 def encrypt_message(plaintext):
-    key = b'Yg&tc%DEuh6%Zc^8'
-    iv  = b'6oyZDr22E3ychjM%'
-    return binascii.hexlify(
-        AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, AES.block_size))
-    ).decode('utf-8')
+    try:
+        key = b'Yg&tc%DEuh6%Zc^8'
+        iv = b'6oyZDr22E3ychjM%'
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        padded = pad(plaintext, AES.block_size)
+        return binascii.hexlify(cipher.encrypt(padded)).decode('utf-8')
+    except Exception as e:
+        app.logger.error(f"encrypt_message: {e}")
+        return None
 
 
-def encrypt_like(uid, region):
-    m = like_pb2.like(); m.uid = int(uid); m.region = region
-    return encrypt_message(m.SerializeToString())
+def create_protobuf_message(user_id, region):
+    try:
+        m = like_pb2.like()
+        m.uid = int(user_id)
+        m.region = region
+        return m.SerializeToString()
+    except Exception as e:
+        app.logger.error(f"create_protobuf_message: {e}")
+        return None
 
 
-def encrypt_uid_proto(uid):
-    m = uid_generator_pb2.uid_generator(); m.saturn_ = int(uid); m.garena = 1
-    return encrypt_message(m.SerializeToString())
+def create_protobuf(uid):
+    try:
+        m = uid_generator_pb2.uid_generator()
+        m.saturn_ = int(uid)
+        m.garena = 1
+        return m.SerializeToString()
+    except Exception as e:
+        app.logger.error(f"create_protobuf: {e}")
+        return None
 
 
-def headers(token):
+def enc(uid):
+    pb = create_protobuf(uid)
+    return encrypt_message(pb) if pb else None
+
+
+# ================= URLs =================
+BD_PERSONAL_SHOW_URL = "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
+BD_VISIT_URL         = "https://clientbp.ggpolarbear.com/VisitProfile"
+
+
+def get_visit_url(region):
+    if region == "IND":
+        return "https://client.ind.freefiremobile.com/VisitProfile"
+    if region in {"BR", "US", "SAC", "NA"}:
+        return "https://client.us.freefiremobile.com/VisitProfile"
+    return BD_VISIT_URL
+
+
+def get_personal_show_url(region):
+    if region == "IND":
+        return "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
+    if region in {"BR", "US", "SAC", "NA"}:
+        return "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
+    return BD_PERSONAL_SHOW_URL
+
+
+def build_headers(token):
     return {
         "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
         "Connection": "Keep-Alive",
@@ -54,206 +105,289 @@ def headers(token):
         "Expect": "100-continue",
         "X-Unity-Version": "2018.4.11f1",
         "X-GA": "v1 1",
-        "ReleaseVersion": "OB55"
+        "ReleaseVersion": "OB55",
     }
 
 
-def post_sync(url, enc_hex, token):
+# ================= ASYNC VISIT =================
+async def send_request(encrypted_uid, token, url):
     try:
-        return requests.post(url, data=bytes.fromhex(enc_hex),
-                             headers=headers(token), verify=False, timeout=15)
+        edata = bytes.fromhex(encrypted_uid)
+        headers = build_headers(token)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=edata, headers=headers) as resp:
+                return await resp.text()
     except Exception as e:
-        app.logger.error(f"post_sync err {url}: {e}")
+        app.logger.error(f"send_request: {e}")
         return None
 
 
-# ========= URL ROUTERS =========
-def base_url(region):
-    if region == "IND": return "https://client.ind.freefiremobile.com"
-    if region in {"BR","US","SAC","NA"}: return "https://client.us.freefiremobile.com"
-    return "https://clientbp.ggpolarbear.com"
-
-def show_url(region):    return base_url(region) + "/GetPlayerPersonalShow"
-def like_url(region):    return base_url(region) + "/LikeProfile"
-
-# 🎯 Friend request endpoints — multiple candidates (একটা কাজ করবে)
-FRIEND_ENDPOINTS = [
-    "/RequestAddingFriend",
-    "/FriendRequest",
-    "/AddFriend",
-    "/SendFriendRequest",
-    "/friend_request",
-    "/RequestFriend",
-]
-
-
-def fetch_info(uid, region, token):
-    r = post_sync(show_url(region), encrypt_uid_proto(uid), token)
-    if r is None: return None
+async def send_visits_with_all_tokens(uid, region, url, tokens):
     try:
-        info = visit_count_pb2.Info()
-        info.ParseFromString(r.content)
-        return info
+        pb = create_protobuf_message(uid, region)
+        if pb is None:
+            return []
+        encrypted_uid = encrypt_message(pb)
+        if encrypted_uid is None:
+            return []
+        tasks = []
+        for t in tokens:
+            tok = t.get("token")
+            if tok:
+                tasks.append(send_request(encrypted_uid, tok, url))
+        if not tasks:
+            return []
+        return await asyncio.gather(*tasks, return_exceptions=True)
     except Exception as e:
-        app.logger.error(f"parse err: {e}")
-        return None
+        app.logger.error(f"send_visits_with_all_tokens: {e}")
+        return []
 
 
-# ========= CORE: try like with ALL tokens until it works =========
-def try_like_until_success(uid, region, tokens, target_likes):
-    encrypted = encrypt_like(uid, region)
-    url = like_url(region)
-    tried = []
+# ================= RAW PROTOBUF DECODER =================
+def _read_varint(data, i):
+    result = 0
+    shift = 0
+    while i < len(data):
+        b = data[i]
+        result |= (b & 0x7F) << shift
+        i += 1
+        if not (b & 0x80):
+            break
+        shift += 7
+    return result, i
 
-    for i, td in enumerate(tokens):
-        tk = td.get("token")
-        if not tk: continue
-        hint = f"...{tk[-8:]}"
 
+def parse_protobuf(data, depth=0, max_depth=15, strict=False):
+    """Schema-free protobuf parser. Returns nested dict {fN: value}"""
+    if depth > max_depth:
+        return None if strict else {}
+    result = {}
+    i = 0
+    data = bytes(data)
+    while i < len(data):
         try:
-            r = post_sync(url, encrypted, tk)
-            if r is None:
-                tried.append({"token": i+1, "hint": hint, "http": "err"})
-                continue
+            tag, i = _read_varint(data, i)
+            field_num = tag >> 3
+            wire_type = tag & 0x7
+            if field_num == 0 or field_num > 536870911:
+                if strict: return None
+                break
+            key = f"f{field_num}"
 
-            if r.status_code != 200:
-                tried.append({"token": i+1, "hint": hint, "http": r.status_code})
-                continue
+            if wire_type == 0:
+                value, i = _read_varint(data, i)
 
-            # 200 → server may have accepted. Verify.
-            time.sleep(1.0)
-            chk = fetch_info(uid, region, tk)
-            if chk and chk.AccountInfo.Likes > target_likes:
-                tried.append({"token": i+1, "hint": hint,
-                              "http": 200, "likes": chk.AccountInfo.Likes})
-                return {
-                    "success": True,
-                    "token_no": i+1,
-                    "token_hint": hint,
-                    "likes_after": chk.AccountInfo.Likes,
-                    "gained": chk.AccountInfo.Likes - target_likes,
-                    "tried": tried,
-                }
+            elif wire_type == 1:
+                if i + 8 > len(data):
+                    if strict: return None
+                    break
+                value = int.from_bytes(data[i:i+8], 'little')
+                i += 8
+
+            elif wire_type == 2:
+                length, i = _read_varint(data, i)
+                if i + length > len(data):
+                    if strict: return None
+                    break
+                raw = data[i:i+length]
+                i += length
+
+                nested = None
+                if length >= 2:
+                    try:
+                        nested = parse_protobuf(raw, depth+1, max_depth, strict=True)
+                    except Exception:
+                        nested = None
+
+                if nested is not None and len(nested) > 0:
+                    value = nested
+                else:
+                    try:
+                        s = raw.decode('utf-8')
+                        if all(c.isprintable() or c in '\n\r\t' for c in s):
+                            value = s
+                        else:
+                            value = raw.hex()
+                    except Exception:
+                        value = raw.hex()
+
+            elif wire_type == 5:
+                if i + 4 > len(data):
+                    if strict: return None
+                    break
+                value = int.from_bytes(data[i:i+4], 'little')
+                i += 4
+
             else:
-                tried.append({"token": i+1, "hint": hint,
-                              "http": 200, "note": "no increment"})
-        except Exception as e:
-            tried.append({"token": i+1, "hint": hint, "err": str(e)})
+                if strict: return None
+                break
 
-    return {
-        "success": False,
-        "token_no": None,
-        "token_hint": None,
-        "likes_after": target_likes,
-        "gained": 0,
-        "tried": tried,
-    }
+            if key in result:
+                if not isinstance(result[key], list):
+                    result[key] = [result[key]]
+                result[key].append(value)
+            else:
+                result[key] = value
+        except Exception:
+            if strict: return None
+            break
 
-
-# ========= Friend request — try multiple endpoints =========
-def try_friend_request(uid, region, token):
-    encrypted = encrypt_like(uid, region)  # reuse like proto (uid + region)
-    endpoint_tries = []
-
-    for ep in FRIEND_ENDPOINTS:
-        url = base_url(region) + ep
-        r = post_sync(url, encrypted, token)
-        if r is None:
-            endpoint_tries.append({"ep": ep, "http": "err"})
-            continue
-        endpoint_tries.append({
-            "ep": ep,
-            "http": r.status_code,
-            "len": len(r.content),
-        })
-        # 404 → endpoint doesn't exist → try next
-        if r.status_code == 404:
-            continue
-        # 200/204/400 → endpoint exists (return whatever it returned)
-        return {
-            "success": r.status_code in (200, 204),
-            "endpoint": ep,
-            "http": r.status_code,
-            "len": len(r.content),
-            "tried": endpoint_tries,
-        }
-
-    return {"success": False, "endpoint": None, "http": 404, "tried": endpoint_tries}
+    if strict and i != len(data):
+        return None
+    return result
 
 
+# ================= FETCH RAW =================
+def fetch_raw_info(uid, region):
+    tokens = load_tokens(region)
+    if not tokens:
+        raise Exception(f"No tokens for region {region}")
+    encrypted_uid = enc(uid)
+    if encrypted_uid is None:
+        raise Exception("Encryption failed")
+    url = get_personal_show_url(region)
+    edata = bytes.fromhex(encrypted_uid)
+    headers = build_headers(tokens[0]['token'])
+    resp = requests.post(url, data=edata, headers=headers, verify=False, timeout=15)
+    if resp.status_code != 200:
+        raise Exception(f"HTTP {resp.status_code}")
+    return resp.content
+
+
+def build_info_dict(uid, region):
+    raw = fetch_raw_info(uid, region)
+    parsed = parse_protobuf(raw)
+    account = parsed.get('f1', {}) if isinstance(parsed.get('f1'), dict) else {}
+
+    known = OrderedDict([
+        ("UID",            account.get('f1')),
+        ("PlayerNickname", account.get('f3')),
+        ("PlayerRegion",   account.get('f5')),
+        ("Levels",         account.get('f6')),
+        ("Likes",          account.get('f21')),
+    ])
+    return {"known": known, "raw": parsed}
+
+
+def format_info_text(info):
+    k = info["known"]
+    lines = [
+        "┌ 𝐀𝐂𝐂𝐎𝐔𝐍𝐓 𝐈𝐍𝐅𝐎",
+        f"├─ Name: {k.get('PlayerNickname', 'N/A')}",
+        f"├─ UID: {k.get('UID', 'N/A')}",
+        f"├─ Region: {k.get('PlayerRegion', 'N/A')}",
+        f"├─ Level: {k.get('Levels', 'N/A')}",
+        f"└─ Likes: {k.get('Likes', 'N/A')}",
+        "",
+        "📊 Full data পেতে /decode <UID> <REGION>",
+    ]
+    return "\n".join(lines)
+
+
+# ================= ROUTES =================
 @app.route('/visit', methods=['GET'])
 def handle_visits():
     global used_count
-
     if request.args.get("key") not in VALID_API_KEYS:
         return app.response_class(
-            response=json.dumps({"error":"Invalid API key","status":3}),
+            response=json.dumps(OrderedDict([("error","Invalid API key"),("status",3)]), separators=(',',':')),
             status=401, mimetype='application/json')
 
     uid    = request.args.get("uid")
-    region = request.args.get("region","").upper()
+    region = request.args.get("region", "").upper()
     if not uid or not region:
-        return {"error":"uid and region required"}, 400
+        return {"error": "UID and region required"}, 400
 
     try:
         tokens = load_tokens(region)
         if not tokens:
-            raise Exception("No tokens")
-        token0 = tokens[0]['token']
+            raise Exception("Failed to load tokens")
 
-        # 1) BEFORE
-        before = fetch_info(uid, region, token0)
-        if before is None:
-            raise Exception("Failed to fetch player info")
-        likes_before = before.AccountInfo.Likes
+        encrypted_uid = enc(uid)
+        if not encrypted_uid:
+            raise Exception("Encryption failed")
 
-        # 2) LIKE — try tokens sequentially until increment
-        like_result = try_like_until_success(uid, region, tokens, likes_before)
+        # player info
+        edata = bytes.fromhex(encrypted_uid)
+        headers = build_headers(tokens[0]['token'])
+        r = requests.post(get_personal_show_url(region),
+                          data=edata, headers=headers, verify=False, timeout=15)
+        parsed = parse_protobuf(r.content)
+        acc = parsed.get('f1', {}) if isinstance(parsed.get('f1'), dict) else {}
 
-        # 3) FRIEND — try multiple endpoints
-        friend_result = try_friend_request(uid, region, token0)
-
-        # 4) AFTER
-        likes_after = like_result["likes_after"]
-        likes_given = like_result["gained"]
-
-        status = 1 if likes_given > 0 else 2
+        # visits
+        results = asyncio.run(send_visits_with_all_tokens(
+            uid, region, get_visit_url(region), tokens))
+        ok   = sum(1 for x in results if x is not None and not isinstance(x, Exception))
+        fail = len(results) - ok
+        status = 1 if ok > 0 else 2
         if status == 1:
             used_count += 1
-        remaining = max(daily_limit - used_count, 0)
 
-        result = OrderedDict([
-            ("PlayerNickname", before.AccountInfo.PlayerNickname),
-            ("UID",            before.AccountInfo.UID),
-            ("Region",         before.AccountInfo.PlayerRegion),
-            ("Level",          before.AccountInfo.Levels),
-            ("LikesBefore",    likes_before),
-            ("LikesAfter",     likes_after),
-            ("LikesGiven",     likes_given),
-            ("LikeTokenUsed",  like_result["token_hint"] or "-"),
-            ("LikeTokenNo",    like_result["token_no"] or "-"),
-            ("LikeTried",      like_result["tried"]),
-            ("FriendRequest",  "sent" if friend_result["success"] else "failed"),
-            ("FriendEndpoint", friend_result.get("endpoint") or "-"),
-            ("FriendHttp",     friend_result.get("http")),
-            ("FriendTried",    friend_result.get("tried", [])),
+        out = OrderedDict([
+            ("TotalTokens",    len(tokens)),
+            ("VisitsSent",     ok),
+            ("VisitsFailed",   fail),
+            ("PlayerNickname", acc.get('f3', 'N/A')),
+            ("Level",          acc.get('f6', 0)),
+            ("Region",         acc.get('f5', region)),
+            ("UID",            acc.get('f1', uid)),
             ("status",         status),
             ("daily_limit",    daily_limit),
             ("used",           used_count),
-            ("remaining",      remaining),
+            ("remaining",      max(daily_limit - used_count, 0)),
         ])
         return app.response_class(
-            response=json.dumps(result, separators=(',',':')),
+            response=json.dumps(out, separators=(',',':'), ensure_ascii=False),
             status=200, mimetype='application/json')
-
     except Exception as e:
-        app.logger.error(f"visit err: {e}")
+        app.logger.error(f"visit error: {e}")
         return {"error": str(e)}, 500
 
 
 @app.route('/like', methods=['GET'])
-def like_legacy():
+def handle_like_legacy():
     return handle_visits()
+
+
+@app.route('/info', methods=['GET'])
+def handle_info():
+    if request.args.get("key") not in VALID_API_KEYS:
+        return {"error": "Invalid API key", "status": 3}, 401
+    uid    = request.args.get("uid")
+    region = request.args.get("region", "").upper()
+    if not uid or not region:
+        return {"error": "UID and region required"}, 400
+    try:
+        data = build_info_dict(uid, region)
+        return app.response_class(
+            response=json.dumps(data, separators=(',',':'), ensure_ascii=False, default=str),
+            status=200, mimetype='application/json')
+    except Exception as e:
+        app.logger.error(f"info error: {e}")
+        return {"error": str(e)}, 500
+
+
+@app.route('/decode', methods=['GET'])
+def handle_decode():
+    """সম্পূর্ণ raw protobuf — কোনো schema লাগে না"""
+    if request.args.get("key") not in VALID_API_KEYS:
+        return {"error": "Invalid API key", "status": 3}, 401
+    uid    = request.args.get("uid")
+    region = request.args.get("region", "").upper()
+    if not uid or not region:
+        return {"error": "UID and region required"}, 400
+    try:
+        raw    = fetch_raw_info(uid, region)
+        parsed = parse_protobuf(raw)
+        return app.response_class(
+            response=json.dumps(
+                {"parsed": parsed, "raw_hex": raw.hex(), "length": len(raw)},
+                separators=(',',':'), ensure_ascii=False, default=str),
+            status=200, mimetype='application/json')
+    except Exception as e:
+        app.logger.error(f"decode error: {e}")
+        return {"error": str(e)}, 500
 
 
 @app.route('/remain', methods=['GET'])
@@ -262,8 +396,87 @@ def remain_info():
         "daily_limit": daily_limit,
         "remaining":   max(daily_limit - used_count, 0),
         "used":        used_count,
-        "reset_info":  "4:00 AM IST"
+        "reset_info":  "4:00 AM IST",
     })
+
+
+# ================= TELEGRAM BOT (webhook) =================
+def tg_send(chat_id, text):
+    if not BOT_TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=10)
+    except Exception as e:
+        app.logger.error(f"tg_send: {e}")
+
+
+@app.route('/webhook/<token>', methods=['POST'])
+def tg_webhook(token):
+    if not BOT_TOKEN or token != BOT_TOKEN:
+        return "forbidden", 403
+    update = request.get_json(silent=True)
+    if not update or 'message' not in update:
+        return "ok", 200
+    msg     = update['message']
+    chat_id = msg['chat']['id']
+    text    = (msg.get('text') or '').strip()
+
+    if text.startswith('/start'):
+        tg_send(chat_id,
+            "🎮 Free Fire Bot\n\n"
+            "/info <UID> <REGION>    — অ্যাকাউন্ট info\n"
+            "/visit <UID> <REGION>   — visit পাঠাও\n"
+            "/decode <UID> <REGION>  — full raw data\n\n"
+            "REGION: BD, IND, BR, US, SAC, NA")
+        return "ok", 200
+
+    parts = text.split()
+    if len(parts) < 3:
+        tg_send(chat_id, "Usage: /cmd <UID> <REGION>")
+        return "ok", 200
+
+    cmd, uid, region = parts[0].lower(), parts[1], parts[2].upper()
+
+    try:
+        if cmd == '/info':
+            tg_send(chat_id, "⏳ Fetching...")
+            tg_send(chat_id, format_info_text(build_info_dict(uid, region)))
+
+        elif cmd == '/decode':
+            raw    = fetch_raw_info(uid, region)
+            parsed = parse_protobuf(raw)
+            txt = "🔍 Raw:\n" + json.dumps(parsed, indent=2, ensure_ascii=False, default=str)[:3800]
+            tg_send(chat_id, txt)
+
+        elif cmd == '/visit':
+            tokens = load_tokens(region)
+            if not tokens:
+                tg_send(chat_id, "❌ No tokens")
+                return "ok", 200
+            tg_send(chat_id, f"⏳ {len(tokens)} tokens দিয়ে পাঠাচ্ছি...")
+            results = asyncio.run(send_visits_with_all_tokens(
+                uid, region, get_visit_url(region), tokens))
+            ok = sum(1 for x in results if x is not None and not isinstance(x, Exception))
+            tg_send(chat_id, f"✅ {ok}/{len(tokens)} visits sent")
+        else:
+            tg_send(chat_id, "Unknown command। /start দাও")
+    except Exception as e:
+        tg_send(chat_id, f"❌ {e}")
+
+    return "ok", 200
+
+
+@app.route('/set_webhook', methods=['GET'])
+def set_webhook():
+    base = request.args.get("base")
+    if not base or not BOT_TOKEN:
+        return {"error": "?base=URL এবং BOT_TOKEN env দরকার"}, 400
+    url = f"{base.rstrip('/')}/webhook/{BOT_TOKEN}"
+    r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={url}")
+    return r.json()
 
 
 if __name__ == '__main__':

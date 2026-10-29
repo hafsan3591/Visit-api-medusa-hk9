@@ -6,7 +6,6 @@ import binascii
 import aiohttp
 import requests
 import json
-import os
 import like_pb2
 import uid_generator_pb2
 from collections import OrderedDict
@@ -17,7 +16,8 @@ app = Flask(__name__)
 VALID_API_KEYS = {"HK345"}
 daily_limit = 200
 used_count = 0
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")   # Vercel Env Var দাও
+
+VALID_REGIONS = {"BD", "IND", "BR", "US", "SAC", "NA"}
 
 # ================= HELPERS =================
 def load_tokens(region):
@@ -53,8 +53,7 @@ def create_protobuf_message(user_id, region):
         m.uid = int(user_id)
         m.region = region
         return m.SerializeToString()
-    except Exception as e:
-        app.logger.error(f"create_protobuf_message: {e}")
+    except Exception:
         return None
 
 
@@ -64,8 +63,7 @@ def create_protobuf(uid):
         m.saturn_ = int(uid)
         m.garena = 1
         return m.SerializeToString()
-    except Exception as e:
-        app.logger.error(f"create_protobuf: {e}")
+    except Exception:
         return None
 
 
@@ -138,12 +136,11 @@ async def send_visits_with_all_tokens(uid, region, url, tokens):
         if not tasks:
             return []
         return await asyncio.gather(*tasks, return_exceptions=True)
-    except Exception as e:
-        app.logger.error(f"send_visits_with_all_tokens: {e}")
+    except Exception:
         return []
 
 
-# ================= RAW PROTOBUF DECODER =================
+# ================= PROTOBUF PARSER (schema-free) =================
 def _read_varint(data, i):
     result = 0
     shift = 0
@@ -158,7 +155,6 @@ def _read_varint(data, i):
 
 
 def parse_protobuf(data, depth=0, max_depth=15, strict=False):
-    """Schema-free protobuf parser. Returns nested dict {fN: value}"""
     if depth > max_depth:
         return None if strict else {}
     result = {}
@@ -176,14 +172,12 @@ def parse_protobuf(data, depth=0, max_depth=15, strict=False):
 
             if wire_type == 0:
                 value, i = _read_varint(data, i)
-
             elif wire_type == 1:
                 if i + 8 > len(data):
                     if strict: return None
                     break
                 value = int.from_bytes(data[i:i+8], 'little')
                 i += 8
-
             elif wire_type == 2:
                 length, i = _read_varint(data, i)
                 if i + length > len(data):
@@ -191,33 +185,26 @@ def parse_protobuf(data, depth=0, max_depth=15, strict=False):
                     break
                 raw = data[i:i+length]
                 i += length
-
                 nested = None
                 if length >= 2:
                     try:
                         nested = parse_protobuf(raw, depth+1, max_depth, strict=True)
                     except Exception:
                         nested = None
-
                 if nested is not None and len(nested) > 0:
                     value = nested
                 else:
                     try:
                         s = raw.decode('utf-8')
-                        if all(c.isprintable() or c in '\n\r\t' for c in s):
-                            value = s
-                        else:
-                            value = raw.hex()
+                        value = s if all(c.isprintable() or c in '\n\r\t' for c in s) else raw.hex()
                     except Exception:
                         value = raw.hex()
-
             elif wire_type == 5:
                 if i + 4 > len(data):
                     if strict: return None
                     break
                 value = int.from_bytes(data[i:i+4], 'little')
                 i += 4
-
             else:
                 if strict: return None
                 break
@@ -231,95 +218,143 @@ def parse_protobuf(data, depth=0, max_depth=15, strict=False):
         except Exception:
             if strict: return None
             break
-
     if strict and i != len(data):
         return None
     return result
 
 
-# ================= FETCH RAW =================
+# ================= FETCH =================
 def fetch_raw_info(uid, region):
     tokens = load_tokens(region)
     if not tokens:
         raise Exception(f"No tokens for region {region}")
     encrypted_uid = enc(uid)
-    if encrypted_uid is None:
+    if not encrypted_uid:
         raise Exception("Encryption failed")
     url = get_personal_show_url(region)
-    edata = bytes.fromhex(encrypted_uid)
     headers = build_headers(tokens[0]['token'])
-    resp = requests.post(url, data=edata, headers=headers, verify=False, timeout=15)
+    resp = requests.post(url, data=bytes.fromhex(encrypted_uid),
+                         headers=headers, verify=False, timeout=15)
     if resp.status_code != 200:
         raise Exception(f"HTTP {resp.status_code}")
     return resp.content
 
 
-def build_info_dict(uid, region):
-    raw = fetch_raw_info(uid, region)
-    parsed = parse_protobuf(raw)
-    account = parsed.get('f1', {}) if isinstance(parsed.get('f1'), dict) else {}
-
-    known = OrderedDict([
-        ("UID",            account.get('f1')),
-        ("PlayerNickname", account.get('f3')),
-        ("PlayerRegion",   account.get('f5')),
-        ("Levels",         account.get('f6')),
-        ("Likes",          account.get('f21')),
-    ])
-    return {"known": known, "raw": parsed}
-
-
-def format_info_text(info):
-    k = info["known"]
-    lines = [
-        "┌ 𝐀𝐂𝐂𝐎𝐔𝐍𝐓 𝐈𝐍𝐅𝐎",
-        f"├─ Name: {k.get('PlayerNickname', 'N/A')}",
-        f"├─ UID: {k.get('UID', 'N/A')}",
-        f"├─ Region: {k.get('PlayerRegion', 'N/A')}",
-        f"├─ Level: {k.get('Levels', 'N/A')}",
-        f"└─ Likes: {k.get('Likes', 'N/A')}",
-        "",
-        "📊 Full data পেতে /decode <UID> <REGION>",
-    ]
-    return "\n".join(lines)
+def extract_player(raw_bytes, uid):
+    parsed = parse_protobuf(raw_bytes)
+    acc = parsed.get('f1', {})
+    if not isinstance(acc, dict):
+        acc = {}
+    return {
+        "UID":            acc.get('f1', uid),
+        "PlayerNickname": acc.get('f3'),
+        "PlayerRegion":   acc.get('f5'),
+        "Levels":         acc.get('f6'),
+        "Likes":          acc.get('f21'),
+        "raw":            parsed,
+    }
 
 
 # ================= ROUTES =================
+
+# ✅ /ffinfo API — /ffinfo?key=HK345&region=BD&uid=11214489525
+@app.route('/ffinfo', methods=['GET'])
+def handle_ffinfo():
+    if request.args.get("key") not in VALID_API_KEYS:
+        return {"error": "Invalid API key", "status": 3}, 401
+
+    region = request.args.get("region", "").upper()
+    uid    = request.args.get("uid", "").strip()
+
+    if not region or not uid:
+        return {
+            "error": "region and uid required",
+            "usage": "/ffinfo?key=HK345&region=BD&uid=11214489525"
+        }, 400
+    if not uid.isdigit():
+        return {"error": "uid must be numeric"}, 400
+    if region not in VALID_REGIONS:
+        return {"error": "invalid region", "valid": list(VALID_REGIONS)}, 400
+
+    try:
+        raw = fetch_raw_info(uid, region)
+        p   = extract_player(raw, uid)
+        result = OrderedDict([
+            ("UID",            p["UID"]),
+            ("PlayerNickname", p["PlayerNickname"]),
+            ("Region",         p["PlayerRegion"] or region),
+            ("Levels",         p["Levels"]),
+            ("Likes",          p["Likes"]),
+        ])
+        return app.response_class(
+            response=json.dumps(result, separators=(',',':'), ensure_ascii=False),
+            status=200, mimetype='application/json')
+    except Exception as e:
+        app.logger.error(f"/ffinfo error: {e}")
+        return {"error": str(e)}, 500
+
+
+# ✅ /rawdata — সব protobuf field দেখায় (debug / schema discover)
+@app.route('/rawdata', methods=['GET'])
+def handle_rawdata():
+    if request.args.get("key") not in VALID_API_KEYS:
+        return {"error": "Invalid API key", "status": 3}, 401
+
+    region = request.args.get("region", "").upper()
+    uid    = request.args.get("uid", "").strip()
+
+    if not region or not uid:
+        return {"error": "region and uid required",
+                "usage": "/rawdata?key=HK345&region=BD&uid=11214489525"}, 400
+    if not uid.isdigit():
+        return {"error": "uid must be numeric"}, 400
+    if region not in VALID_REGIONS:
+        return {"error": "invalid region", "valid": list(VALID_REGIONS)}, 400
+
+    try:
+        raw    = fetch_raw_info(uid, region)
+        parsed = parse_protobuf(raw)
+        return app.response_class(
+            response=json.dumps({
+                "parsed": parsed,
+                "raw_hex": raw.hex(),
+                "length": len(raw),
+            }, separators=(',',':'), ensure_ascii=False, default=str),
+            status=200, mimetype='application/json')
+    except Exception as e:
+        app.logger.error(f"/rawdata error: {e}")
+        return {"error": str(e)}, 500
+
+
+# ✅ /visit — visit পাঠায়
 @app.route('/visit', methods=['GET'])
 def handle_visits():
     global used_count
     if request.args.get("key") not in VALID_API_KEYS:
-        return app.response_class(
-            response=json.dumps(OrderedDict([("error","Invalid API key"),("status",3)]), separators=(',',':')),
-            status=401, mimetype='application/json')
+        return {"error": "Invalid API key", "status": 3}, 401
 
-    uid    = request.args.get("uid")
     region = request.args.get("region", "").upper()
-    if not uid or not region:
-        return {"error": "UID and region required"}, 400
+    uid    = request.args.get("uid", "").strip()
+
+    if not region or not uid:
+        return {"error": "region and uid required"}, 400
+    if not uid.isdigit():
+        return {"error": "uid must be numeric"}, 400
+    if region not in VALID_REGIONS:
+        return {"error": "invalid region", "valid": list(VALID_REGIONS)}, 400
 
     try:
         tokens = load_tokens(region)
         if not tokens:
-            raise Exception("Failed to load tokens")
+            raise Exception(f"No tokens for region {region}")
 
-        encrypted_uid = enc(uid)
-        if not encrypted_uid:
-            raise Exception("Encryption failed")
+        raw    = fetch_raw_info(uid, region)
+        player = extract_player(raw, uid)
 
-        # player info
-        edata = bytes.fromhex(encrypted_uid)
-        headers = build_headers(tokens[0]['token'])
-        r = requests.post(get_personal_show_url(region),
-                          data=edata, headers=headers, verify=False, timeout=15)
-        parsed = parse_protobuf(r.content)
-        acc = parsed.get('f1', {}) if isinstance(parsed.get('f1'), dict) else {}
-
-        # visits
         results = asyncio.run(send_visits_with_all_tokens(
             uid, region, get_visit_url(region), tokens))
-        ok   = sum(1 for x in results if x is not None and not isinstance(x, Exception))
-        fail = len(results) - ok
+
+        ok = sum(1 for x in results if x is not None and not isinstance(x, Exception))
         status = 1 if ok > 0 else 2
         if status == 1:
             used_count += 1
@@ -327,11 +362,11 @@ def handle_visits():
         out = OrderedDict([
             ("TotalTokens",    len(tokens)),
             ("VisitsSent",     ok),
-            ("VisitsFailed",   fail),
-            ("PlayerNickname", acc.get('f3', 'N/A')),
-            ("Level",          acc.get('f6', 0)),
-            ("Region",         acc.get('f5', region)),
-            ("UID",            acc.get('f1', uid)),
+            ("VisitsFailed",   len(results) - ok),
+            ("PlayerNickname", player["PlayerNickname"]),
+            ("Level",          player["Levels"]),
+            ("Region",         player["PlayerRegion"] or region),
+            ("UID",            player["UID"]),
             ("status",         status),
             ("daily_limit",    daily_limit),
             ("used",           used_count),
@@ -341,53 +376,13 @@ def handle_visits():
             response=json.dumps(out, separators=(',',':'), ensure_ascii=False),
             status=200, mimetype='application/json')
     except Exception as e:
-        app.logger.error(f"visit error: {e}")
+        app.logger.error(f"/visit error: {e}")
         return {"error": str(e)}, 500
 
 
 @app.route('/like', methods=['GET'])
 def handle_like_legacy():
     return handle_visits()
-
-
-@app.route('/info', methods=['GET'])
-def handle_info():
-    if request.args.get("key") not in VALID_API_KEYS:
-        return {"error": "Invalid API key", "status": 3}, 401
-    uid    = request.args.get("uid")
-    region = request.args.get("region", "").upper()
-    if not uid or not region:
-        return {"error": "UID and region required"}, 400
-    try:
-        data = build_info_dict(uid, region)
-        return app.response_class(
-            response=json.dumps(data, separators=(',',':'), ensure_ascii=False, default=str),
-            status=200, mimetype='application/json')
-    except Exception as e:
-        app.logger.error(f"info error: {e}")
-        return {"error": str(e)}, 500
-
-
-@app.route('/decode', methods=['GET'])
-def handle_decode():
-    """সম্পূর্ণ raw protobuf — কোনো schema লাগে না"""
-    if request.args.get("key") not in VALID_API_KEYS:
-        return {"error": "Invalid API key", "status": 3}, 401
-    uid    = request.args.get("uid")
-    region = request.args.get("region", "").upper()
-    if not uid or not region:
-        return {"error": "UID and region required"}, 400
-    try:
-        raw    = fetch_raw_info(uid, region)
-        parsed = parse_protobuf(raw)
-        return app.response_class(
-            response=json.dumps(
-                {"parsed": parsed, "raw_hex": raw.hex(), "length": len(raw)},
-                separators=(',',':'), ensure_ascii=False, default=str),
-            status=200, mimetype='application/json')
-    except Exception as e:
-        app.logger.error(f"decode error: {e}")
-        return {"error": str(e)}, 500
 
 
 @app.route('/remain', methods=['GET'])
@@ -398,85 +393,6 @@ def remain_info():
         "used":        used_count,
         "reset_info":  "4:00 AM IST",
     })
-
-
-# ================= TELEGRAM BOT (webhook) =================
-def tg_send(chat_id, text):
-    if not BOT_TOKEN:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=10)
-    except Exception as e:
-        app.logger.error(f"tg_send: {e}")
-
-
-@app.route('/webhook/<token>', methods=['POST'])
-def tg_webhook(token):
-    if not BOT_TOKEN or token != BOT_TOKEN:
-        return "forbidden", 403
-    update = request.get_json(silent=True)
-    if not update or 'message' not in update:
-        return "ok", 200
-    msg     = update['message']
-    chat_id = msg['chat']['id']
-    text    = (msg.get('text') or '').strip()
-
-    if text.startswith('/start'):
-        tg_send(chat_id,
-            "🎮 Free Fire Bot\n\n"
-            "/info <UID> <REGION>    — অ্যাকাউন্ট info\n"
-            "/visit <UID> <REGION>   — visit পাঠাও\n"
-            "/decode <UID> <REGION>  — full raw data\n\n"
-            "REGION: BD, IND, BR, US, SAC, NA")
-        return "ok", 200
-
-    parts = text.split()
-    if len(parts) < 3:
-        tg_send(chat_id, "Usage: /cmd <UID> <REGION>")
-        return "ok", 200
-
-    cmd, uid, region = parts[0].lower(), parts[1], parts[2].upper()
-
-    try:
-        if cmd == '/info':
-            tg_send(chat_id, "⏳ Fetching...")
-            tg_send(chat_id, format_info_text(build_info_dict(uid, region)))
-
-        elif cmd == '/decode':
-            raw    = fetch_raw_info(uid, region)
-            parsed = parse_protobuf(raw)
-            txt = "🔍 Raw:\n" + json.dumps(parsed, indent=2, ensure_ascii=False, default=str)[:3800]
-            tg_send(chat_id, txt)
-
-        elif cmd == '/visit':
-            tokens = load_tokens(region)
-            if not tokens:
-                tg_send(chat_id, "❌ No tokens")
-                return "ok", 200
-            tg_send(chat_id, f"⏳ {len(tokens)} tokens দিয়ে পাঠাচ্ছি...")
-            results = asyncio.run(send_visits_with_all_tokens(
-                uid, region, get_visit_url(region), tokens))
-            ok = sum(1 for x in results if x is not None and not isinstance(x, Exception))
-            tg_send(chat_id, f"✅ {ok}/{len(tokens)} visits sent")
-        else:
-            tg_send(chat_id, "Unknown command। /start দাও")
-    except Exception as e:
-        tg_send(chat_id, f"❌ {e}")
-
-    return "ok", 200
-
-
-@app.route('/set_webhook', methods=['GET'])
-def set_webhook():
-    base = request.args.get("base")
-    if not base or not BOT_TOKEN:
-        return {"error": "?base=URL এবং BOT_TOKEN env দরকার"}, 400
-    url = f"{base.rstrip('/')}/webhook/{BOT_TOKEN}"
-    r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={url}")
-    return r.json()
 
 
 if __name__ == '__main__':

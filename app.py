@@ -164,6 +164,77 @@ def make_request(encrypt, region, token):
         return None
 
 
+# =========================================================
+# ✅ NEW: /ffinfo endpoint  (player info only, no likes)
+# =========================================================
+@app.route('/ffinfo', methods=['GET'])
+def ffinfo():
+    api_key = request.args.get("key")
+    if api_key not in VALID_API_KEYS:
+        result = OrderedDict([
+            ("error", "Invalid or missing API key"),
+            ("status", 3)
+        ])
+        return app.response_class(
+            response=json.dumps(result, separators=(',', ':')),
+            status=401,
+            mimetype='application/json'
+        )
+
+    uid = request.args.get("uid")
+    region = request.args.get("region", "").upper()
+    if not uid or not region:
+        return {"error": "UID and region are required"}, 400
+
+    try:
+        tokens = load_tokens(region)
+        if not tokens:
+            raise Exception("Failed to load tokens.")
+
+        token = tokens[0]['token']
+        encrypted_uid = enc(uid)
+        if encrypted_uid is None:
+            raise Exception("Encryption of UID failed.")
+
+        info = make_request(encrypted_uid, region, token)
+
+        # If info is None or nickname is empty => banned / not found
+        if info is None or not getattr(info.AccountInfo, "PlayerNickname", ""):
+            result = OrderedDict([
+                ("UID", uid),
+                ("Region", region),
+                ("AccountStatus", "Banned / Not Found"),
+                ("PlayerNickname", None),
+                ("Level", None),
+                ("Likes", None),
+                ("status", 2)
+            ])
+            return app.response_class(
+                response=json.dumps(result, separators=(',', ':')),
+                status=200,
+                mimetype='application/json'
+            )
+
+        result = OrderedDict([
+            ("PlayerNickname", info.AccountInfo.PlayerNickname),
+            ("UID", info.AccountInfo.UID),
+            ("Level", info.AccountInfo.Levels),
+            ("Likes", info.AccountInfo.Likes),
+            ("Region", info.AccountInfo.PlayerRegion),
+            ("AccountStatus", "Active"),
+            ("status", 1)
+        ])
+        return app.response_class(
+            response=json.dumps(result, separators=(',', ':')),
+            status=200,
+            mimetype='application/json'
+        )
+
+    except Exception as e:
+        app.logger.error(f"ffinfo error: {e}")
+        return {"error": str(e)}, 500
+
+
 @app.route('/like', methods=['GET'])
 def handle_requests():
     global used_count
